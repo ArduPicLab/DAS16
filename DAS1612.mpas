@@ -1,0 +1,180 @@
+program DAS1612;
+{ Declarations section }
+// DAS1612 acquisition program
+// PIC16F73 controls an AD574 acquisition board
+// get acquisition parameters from a config. string
+// output data in +/- 5000 or 10000 mV
+// I/O CONFIGURATION:
+// DIP baud-rate   input   A2,A3      0..4: 9600,19200,57600,115200
+// ADC CFS         output  A4         Lo: +/-5V, Hi: +/-10V FS
+// LED ACQ         output  A5         Hi: ON
+// MPX address   output    C0,C3
+// ADC data bus   input    B0,B7
+// ADC EOC        input    A0         Hi->Lo: End Of Conversion
+// ADC STR        output   C4         Hi->Lo->Hi: Start Of Conversion
+// ADC CA0(Hi/Lo) output   C5         Lo: ADC MS byte, Hi: ADC LS digit
+// start buttton  input    A1         Lo: Start
+// Serial Tx      output   C6
+// Serial Rx      input    C7
+// MCU Xtal: 18.432 MHz
+// New version - G. Carrera 26/06/2016
+
+const
+  CR: char = 13;
+  LF: char = 10;
+var
+  b,chin,chfi,BPm,baud,FS,ic,temp: byte;
+  Ns,sc,ts,ttx,tscan: word;
+  cf: real;
+  sigdata: integer;
+  cis,cfs,Rs,Tms: string[3];
+  NSs,tx6: string[6];
+  int0flg,err: boolean;
+
+procedure interrupt;
+// timer#0 for interrupt every 1 msec (1000Hz)
+begin
+  if TestBit(INTCON, T0IF) then  // timer#0 interrupt
+    begin
+      ClearBit(INTCON, T0IF); // reset Timer#0 interrupt flag
+      TMR0:= 238;
+      SetBit(INTCON, T0IE); // Enables Timer#0 interrupt
+      int0flg:= true;
+    end;
+end;
+
+procedure IOinit;
+// initialize I/O
+begin
+  PORTA:=0; // ACQ LED off, +/-5V FS
+  ADCON1:=$06;{PortA : Digital I/O}
+  TRISA:= $CF;{PORTA bits 4,5 are outputs}
+  TRISC:= $80;{PORTC bits 0..6 are outputs}
+  {PortB is 8 bit inputs}
+  ClearBit(PORTC, 5);  // Clear CA0
+  SetBit(PORTC, 4);  // ADC Strobe = Hi
+  baud:= (PORTA And $0C) Shr 2; {read  baud rate DIP}
+  case baud of
+    0: UART1_Init(9600);
+    1: UART1_Init(19200);
+    2: UART1_Init(57600);
+    3: UART1_Init(115200);
+  end;
+  OPTION_REG:= $07;{set prescaler of Timer#0 to 256,PB pull-up disabled}
+  TMR0:= 238; // T0 overflow every 18 counts
+  SetBit(INTCON, T0IE); // Enables Timer#0 interrupt
+  ClearBit(INTCON, T0IF); // reset Timer#0 interrupt flag
+  SetBit(INTCON, GIE); // Enables global interrupt
+  int0flg:= false;
+end;
+
+function GetByte: char;
+// get a byte from UART1 and convert in upper case
+begin
+  if UART1_Data_Ready() = 1 then
+    begin
+      result:= UART1_Read;
+      if (result>=$61) And (result<$7B) then result:= result-$20; {Upper Case convert}
+    end;
+end;
+
+
+begin  { Main program }
+  IOinit;
+  UART1_Write_Text('DAS1612 serial acquisition system'+CR+LF);
+  UART1_Write_Text('Cfg string: $ci,cf,BPm,ns,fs*'+CR+LF);
+  UART1_Write_Text('Base Period is 1 [ms]'+CR+LF);
+  UART1_Write_Text('G.Carrera -- rev. 26/06/16'+CR+LF);
+   repeat  {get acquisition configuration string}
+    UART1_Write_Text('Waiting for configuration string..'+CR+LF);
+    {get configuration string: $ci,cf,BPm,ns,fs* ,Base Period = 10ms}
+    repeat until GetByte='$'; {wait for configuration string}
+    err:= false;
+    //read the configuration parameters
+    UART1_Read_Text(cis,',',3); {read start channel}
+    UART1_Read_Text(cfs,',',3); {read last channel}
+    UART1_Read_Text(Tms,',',10); {read Base Period multiplier}
+    UART1_Read_Text(NSs,',',10); {read Number of samples }
+    UART1_Read_Text(Rs,'*',3); {read ADC Full Scale}
+    // convert in numerical format
+    chin:= byte(StrToInt(cis));
+    chfi:= byte(StrToInt(cfs));
+    BPm:= byte(StrToInt(Tms));
+    Ns:= StrToWord(NSs);
+    FS:= byte(StrToInt(Rs));
+    // now controls parameters
+    if (chin>15) or (chfi>15) or (chin>chfi) then err:= true;
+    if (BPm=0) or (NS=0) then err:= true;
+    if (FS=5) then ClearBit(PORTA, 4)  {+/-5V}
+    else if (FS=10) then SetBit(PORTA, 4) {+/-10V}
+    else err:= true; {errors on config string}
+    if err then UART1_Write_Text('Errors on configuration string !!'+CR+LF);
+    //PeriodVerify;
+    
+    b:= (chfi-chin+1)*6+2;{number of characters to transmit}
+    ts:= BPm*1000; {sample period in micros}
+    tscan:= (chfi-chin+1)*25; {scan time in microseconds}
+    case baud of  {transmit time in microseconds}
+      0: ttx:= 1042*b;
+      1: ttx:= 521*b;
+      2: ttx:= 174*b;
+      3: ttx:= 87*b;
+    end;
+    if ((tscan+ttx) > ts) then
+      begin
+        UART1_Write_Text('Ts is incompatible with baud rate !!'+CR+LF);
+        WordToStr(word(tscan+ttx), tx6);
+        UART1_Write_Text('Ts must be greater than '+tx6+' [us]'+CR+LF);
+        err:= true;
+      end;
+   until err=0;
+   // print acquisition parameters
+   UART1_Write_Text(CR+LF);
+   UART1_Write_Text('Initial Ch = '+cis+', Final Ch = '+cfs+', +/- F.S. [V] = '+Rs+CR+LF);
+   UART1_Write_Text('Ts [ms] = '+Tms+', Samples = '+NSs+CR+LF);
+   cf:= FS*1000/2047; // mV conversion factor
+  while true Do //  endless loop
+    begin
+      UART1_Write_Text('Push Start Button or write A to start'+CR+LF);
+      repeat until (GetByte='A') Or (TestBit(PORTA, 1)=0);
+      ic:=0;
+      UART1_Write_Text(CR+LF);
+      SetBit(PORTA, 5);  // LED on
+      UART1_Write_Text('DATA'+CR+LF);
+      ic:=0; sc:=0;
+      while sc<ns Do
+        begin
+          if int0flg then
+             begin
+               int0flg:= false;
+               ic:=ic+1; {counts periods of 10ms}
+             end;
+          if (ic= BPm) then
+            begin {scan every sample period}
+              ic:=0;
+              b:= chin;
+              for b:= chin to chfi  do
+                begin {scan channels and transmit}
+                  PORTC:= (PORTC And $F0) + b; // set channel address
+                  Delay_us(2);
+                  ClearBit(PORTC, 4);{ADC Strobe = Lo}
+                  SetBit(PORTC, 4);{ADC Strobe = Hi}
+                  repeat until TestBit(PORTA, 0);{wait for /EOC going Hi}
+                  repeat until (TestBit(PORTA, 0)=0);{wait for /EOC going Lo}
+                  sigdata:= PORTB shl 4;{shift MS byte}
+                  SetBit(PORTC, 5);{CA0=Hi -> LS digit}
+                  temp:= PORTB shr 4; {shift LS digit}
+                  ClearBit(PORTC, 5);  // Clear CA0
+                  {assemble and convert data from offset binary code}
+                  sigdata:= (sigdata or integer(temp))-2048;
+                  sigdata:= integer(sigdata*cf);{convert in mV}
+                  IntToStr(sigdata,tx6);
+                  UART1_Write_Text(tx6);{now transmit data}
+                end;
+              UART1_Write_Text(CR+LF);
+              sc:=sc+1; {increment sample counter}
+            end; {end of scan loop}
+        end; {end of acquisition loop}
+        ClearBit(PORTA, 5);  // LED off
+    end;{end of endless loop}
+end.
